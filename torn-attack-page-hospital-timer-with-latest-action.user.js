@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Attack Page Hospital Timer with Latest Action
 // @namespace    tatzelbelm.torn.attack-page-hospital-timer-with-latest-action
-// @version      1.5.0
+// @version      1.5.1
 // @description  On the attack page, replaces the "currently in hospital" notice with a live countdown, and shows the target's last action.
 // @author       tatzelbelm
 // @license      MIT
@@ -88,6 +88,14 @@
   let apiError = '';
   let loaded = false;
   let outSince = 0;       // when we first noticed the timer was finished
+  let noticeSince = 0;    // when Torn's hospital notice appeared on the page
+  let lastFetchOk = 0;    // when we last got good data from the API
+  let lastRequest = 0;    // when we last asked the API
+  let inFlight = false;
+
+  // Torn's API may return cached data for up to 30 seconds
+  const API_CACHE_SECONDS = 35;
+  const RECHECK_SECONDS = 10;
 
   let hospEl = null;      // the page element that holds the hospital message
   let infoEl = null;      // our "Last action" line
@@ -128,9 +136,13 @@
       render();
       return;
     }
+    if (inFlight) return;
+    inFlight = true;
+    lastRequest = nowSec();
     try {
       const d = await getJson(
-        `https://api.torn.com/user/${targetId}?selections=profile&key=${KEY}&comment=AttackPageHospTimer`
+        `https://api.torn.com/user/${targetId}?selections=profile&key=${KEY}` +
+        `&timestamp=${nowSec()}&comment=AttackPageHospTimer`
       );
       if (d.error) {
         apiError = d.error.error || 'API error';
@@ -149,11 +161,20 @@
         setPanelStatus('Key saved and working', false);
       }
       const inHosp = (d.status && d.status.state) === 'Hospital';
-      hospUntil = inHosp ? (d.states?.hospital_timestamp || d.status?.until || 0) : 0;
+      if (inHosp) {
+        hospUntil = d.states?.hospital_timestamp || d.status?.until || 0;
+      } else if (!(hospUntil && hospUntil <= nowSec())) {
+        // Not in hospital (and not just a timer that ran out normally, which we keep
+        // so the "OUT NOW..." grace period still applies)
+        hospUntil = 0;
+      }
       lastActionTs = d.last_action?.timestamp || 0;
       lastStatus = d.last_action?.status || '';
+      lastFetchOk = nowSec();
     } catch (e) {
       apiError = 'Could not reach Torn API';
+    } finally {
+      inFlight = false;
     }
     render();
   }
@@ -171,30 +192,53 @@
   function hospitalHtml() {
     if (!loaded) return null;
     const left = hospUntil - nowSec();
+    const refreshLink = `OUT OF HOSPITAL<br><span data-ahc-refresh="1" style="cursor:pointer;text-decoration:underline">CLICK TO REFRESH</span>`;
+
     if (hospUntil && left > 0) {
       outSince = 0;
       return `IN HOSPITAL<br>OUT IN ${fmtCountdown(left)}`;
     }
-    if (!outSince) outSince = nowSec();
-    if (nowSec() - outSince < GRACE_SECONDS) {
-      return `IN HOSPITAL<br>OUT NOW...`;
+    if (hospUntil) {
+      // Timer ran out normally
+      if (!outSince) outSince = nowSec();
+      if (nowSec() - outSince < GRACE_SECONDS) {
+        return `IN HOSPITAL<br>OUT NOW...`;
+      }
+      // Torn's page still hasn't updated by itself, so offer a manual refresh
+      return refreshLink;
     }
-    // Torn's page still hasn't updated by itself, so offer a manual refresh
-    return `OUT OF HOSPITAL<br><span data-ahc-refresh="1" style="cursor:pointer;text-decoration:underline">CLICK TO REFRESH</span>`;
+
+    // Our data says "not in hospital" but Torn is showing the hospital notice,
+    // e.g. you've just put them in hospital. Only believe "not in hospital" if the
+    // data is fresh enough to be newer than the notice (allowing for API caching).
+    if (lastFetchOk < noticeSince + API_CACHE_SECONDS) {
+      if (!inFlight && nowSec() - lastRequest >= RECHECK_SECONDS) fetchTarget();
+      return `IN HOSPITAL<br>CHECKING TIMER...`;
+    }
+    // Fresh data confirms they're out (e.g. revived early)
+    return refreshLink;
   }
 
   function renderHospital() {
-    const html = hospitalHtml();
-    if (html === null) return;
-
     // Torn's page re-renders the notice every few seconds. If it has put its
     // own text back (or made a brand-new element), find it again.
     if (!hospEl || !hospEl.isConnected || !hospEl.dataset.ahc) {
       const found = findHospitalElement();
-      if (!found) { hospEl = null; return; } // notice gone, e.g. "Start fight" is showing
+      if (!found) {               // notice gone, e.g. "Start fight" is showing
+        hospEl = null;
+        noticeSince = 0;
+        return;
+      }
       hospEl = found;
       hospEl.dataset.ahc = '1';
+      if (!noticeSince) {
+        noticeSince = nowSec();
+        // The notice has just appeared - get fresh data straight away
+        if (loaded && !hospUntil && !inFlight) fetchTarget();
+      }
     }
+    const html = hospitalHtml();
+    if (html === null) return;
     if (hospEl.innerHTML !== html) hospEl.innerHTML = html;
   }
 
@@ -427,6 +471,11 @@
     // Manual refresh link (only fires when you click/tap it)
     document.addEventListener('click', (e) => {
       if (e.target.closest && e.target.closest('[data-ahc-refresh]')) location.reload();
+    });
+
+    // Coming back to the tab: get fresh data straight away
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) fetchTarget();
     });
 
     fetchTarget();
